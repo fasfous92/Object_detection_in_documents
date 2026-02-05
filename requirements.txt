@@ -1,14 +1,14 @@
-# Core Machine Learning Framework
-torch>=2.0.1
-torchvision>=0.15.2
-torchaudio>=2.0.2
+# # Core Machine Learning Framework
+# torch>=2.0.1
+# torchvision>=0.15.2
+# torchaudio>=2.0.2
 
-# Model Loading and Handling (Hugging Face Stack)
-# Necessary for Vicuna-7B v1.5 and CLIP ViT-L-336px
-transformers>=4.31.0
-accelerate>=0.21.0
-sentencepiece
-protobuf
+# # Model Loading and Handling (Hugging Face Stack)
+# # Necessary for Vicuna-7B v1.5 and CLIP ViT-L-336px
+# transformers>=4.31.0
+# accelerate>=0.21.0
+# sentencepiece
+# protobuf
 
 # Optimization and Quantization (Essential for Kaggle/T4 GPUs)
 # Allows loading the 7B model in 4-bit/8-bit to save VRAM
@@ -32,3 +32,7 @@ nltk
 # Evaluation Benchmarks
 # Needed for COCO, OmniLabel, and D3 metrics
 pycocotools
+
+#donwload signature datasets
+roboflow
+albumentations

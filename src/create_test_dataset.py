@@ -1,76 +1,147 @@
 import os
 import json
 import requests
+import zipfile
+import shutil
 from PIL import Image
 from io import BytesIO
 from tqdm import tqdm
 
-def create_tiny_dataset(output_dir="data"):
-    """
-    Downloads 10 real images from COCO and creates a mini rod_dataset.json
-    compatible with our training script.
-    """
+def download_file(url, save_path):
+    """Helper to download large files."""
+    if os.path.exists(save_path):
+        print(f"File {save_path} already exists. Skipping download.")
+        return
+    
+    print(f"Downloading {url}...")
+    response = requests.get(url, stream=True)
+    total_size = int(response.headers.get('content-length', 0))
+    
+    with open(save_path, 'wb') as f, tqdm(total=total_size, unit='B', unit_scale=True) as bar:
+        for chunk in response.iter_content(chunk_size=1024):
+            if chunk:
+                f.write(chunk)
+                bar.update(len(chunk))
+
+def create_dataset(output_dir="data", limit=200):
     images_dir = os.path.join(output_dir, "images")
     os.makedirs(images_dir, exist_ok=True)
     
     rod_dir = os.path.join(output_dir, "ROD")
     os.makedirs(rod_dir, exist_ok=True)
+
+    # 1. Download Annotations
+    anno_zip_url = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+    zip_path = "annotations_trainval2017.zip"
+    download_file(anno_zip_url, zip_path)
+
+    # 2. Unzip and Load JSON
+    print("Extracting annotations...")
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        # We only need instances_val2017.json
+        zip_ref.extract("annotations/instances_val2017.json", path=".")
     
-    # 1. Define 10 Real Samples (Images + Prompts + Boxes)
-    # Format: [Image_URL, Filename, Prompt, Box [x, y, w, h]]
-    # Note: Boxes are normalized [0-1] for simplicity in this test generator
-    samples = [
-        # Cat image
-        ("http://images.cocodataset.org/val2017/000000039769.jpg", "000000039769.jpg", 
-         "Locate <p>the cats</p>.", [0.1, 0.1, 0.8, 0.8]), 
-        # Horse
-        ("http://images.cocodataset.org/val2017/000000019623.jpg", "000000019623.jpg",
-         "Find <p>the person</p>.", [0.3, 0.2, 0.2, 0.5]),
-        # Train
-        ("http://images.cocodataset.org/val2017/000000255393.jpg", "000000255393.jpg",
-         "Locate <p>the train</p>.", [0.1, 0.3, 0.8, 0.5]),
-        # Bus
-        ("http://images.cocodataset.org/val2017/000000122765.jpg", "000000122765.jpg",
-         "Where is <p>the bus</p>?", [0.1, 0.2, 0.7, 0.6]),
-        # Zebra
-        ("http://images.cocodataset.org/val2017/000000008690.jpg", "000000008690.jpg",
-         "Detect <p>the zebra</p>.", [0.2, 0.3, 0.5, 0.5]),
-    ]
+    anno_file = "annotations/instances_val2017.json"
+    print(f"Loading {anno_file}...")
+    with open(anno_file, 'r') as f:
+        coco = json.load(f)
+
+    # Create Maps for fast lookup
+    # category_id -> name (e.g., 1 -> "person")
+    cat_map = {c['id']: c['name'] for c in coco['categories']}
+    # image_id -> file_name
+    img_map = {i['id']: i['file_name'] for i in coco['images']}
+    # image_id -> list of annotations
+    img_to_anns = {}
+    for ann in coco['annotations']:
+        img_id = ann['image_id']
+        if img_id not in img_to_anns:
+            img_to_anns[img_id] = []
+        img_to_anns[img_id].append(ann)
+
+    # 3. Build Dataset
+    rod_data = []
     
-    json_data = []
+    # We filter for images that have annotations
+    valid_image_ids = list(img_to_anns.keys())
     
-    print(f"Downloading {len(samples)} images for Tiny Dataset...")
+    print(f"Found {len(valid_image_ids)} images with annotations. Selecting first {limit}...")
     
-    for url, filename, prompt, box in tqdm(samples):
-        # Download Image
-        try:
-            response = requests.get(url, timeout=10)
-            img = Image.open(BytesIO(response.content)).convert("RGB")
-            img.save(os.path.join(images_dir, filename))
+    count = 0
+    for img_id in tqdm(valid_image_ids):
+        if count >= limit:
+            break
             
-            # Create Annotation Entry
-            # We construct a fake "None" negative sample for variety if needed, 
-            # but for now let's stick to positives to ensure gradients flow.
-            entry = {
-                "image_id": filename.split(".")[0],
+        filename = img_map[img_id]
+        anns = img_to_anns[img_id]
+        
+        # Pick the largest object in the image to be the "main" target
+        # (Heuristic to get clear training examples)
+        best_ann = max(anns, key=lambda x: x['bbox'][2] * x['bbox'][3])
+        category_name = cat_map[best_ann['category_id']]
+        bbox = best_ann['bbox'] # [x, y, w, h] (Absolute pixels)
+        
+        # COCO Bbox is [x, y, w, h] absolute. 
+        # Our locator usually expects normalized [0-1] relative to image size.
+        # We need image dimensions to normalize.
+        # Ideally we load image first, or check coco['images'] metadata.
+        img_meta = next(item for item in coco['images'] if item["id"] == img_id)
+        width, height = img_meta['width'], img_meta['height']
+        
+        norm_box = [
+            bbox[0] / width,
+            bbox[1] / height,
+            bbox[2] / width,
+            bbox[3] / height
+        ]
+        
+        # Download Image
+        img_url = f"http://images.cocodataset.org/val2017/{filename}"
+        save_path = os.path.join(images_dir, filename)
+        
+        try:
+            # Only download if we don't have it
+            if not os.path.exists(save_path):
+                response = requests.get(img_url, timeout=5)
+                if response.status_code == 200:
+                    with open(save_path, 'wb') as f:
+                        f.write(response.content)
+                else:
+                    continue # Skip if download fails
+            
+            # Verify image is valid
+            try:
+                Image.open(save_path).verify()
+            except:
+                continue
+
+            # Add to dataset
+            rod_data.append({
+                "image_id": str(img_id),
                 "file_name": filename,
-                "prompt": prompt,
-                "boxes": [box], # List of boxes
+                "prompt": f"Locate <p>the {category_name}</p>.",
+                "boxes": [norm_box], # List of boxes
                 "is_negative": False
-            }
-            json_data.append(entry)
+            })
+            count += 1
             
         except Exception as e:
-            print(f"Failed to download {url}: {e}")
+            print(f"Skipping {filename}: {e}")
+            continue
 
-    # Save JSON
+    # 4. Save JSON
     json_path = os.path.join(rod_dir, "rod_dataset.json")
     with open(json_path, "w") as f:
-        json.dump(json_data, f, indent=4)
+        json.dump(rod_data, f, indent=4)
         
-    print(f"\n✓ Tiny Dataset created at {output_dir}")
-    print(f"  - Images: {len(json_data)}")
-    print(f"  - Annotation File: {json_path}")
+    # Cleanup
+    if os.path.exists("annotations"):
+        shutil.rmtree("annotations")
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+
+    print(f"\n✓ Dataset created with {len(rod_data)} samples.")
+    print(f"  - Saved to: {json_path}")
 
 if __name__ == "__main__":
-    create_tiny_dataset()
+    create_dataset(limit=4900)
