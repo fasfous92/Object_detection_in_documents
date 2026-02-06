@@ -10,7 +10,7 @@ from tqdm import tqdm
 from torchvision.ops import roi_align
 
 from src.model import RODMLLM
-from src.ingestion import RODDataset 
+from utils.ingestion import RODDataset 
 
 # --- COLLATOR ---
 class RealDataCollator:

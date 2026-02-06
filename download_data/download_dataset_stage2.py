@@ -7,21 +7,16 @@ import albumentations as A
 from roboflow import Roboflow
 from tqdm import tqdm
 from glob import glob
-import dotenv
-
 import os
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
-# Print where Python is currently "standing"
-print(f"Current Working Directory: {os.getcwd()}")
+load_dotenv(dotenv_path='.env')
 
 
 
 
 # --- CONFIGURATION ---
-ROBOFLOW_API_KEY = "CjgyrlRk1OHPdFWIXboq" #os.getenv("ROBOFLOW_API_KEY") # Replace if not using env var
-print(ROBOFLOW_API_KEY)
+ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY") 
 WORKSPACE = "tech-ysdkk"
 PROJECT = "signature-detection-hlx8j"
 VERSION = 3
