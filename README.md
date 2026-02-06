@@ -20,10 +20,10 @@ This stage aligns the visual encoder (CLIP) with the LLM using the COCO dataset.
 
 ```bash
 # Download COCO dataset
-python src/download_dataset_stage1.py
+python download_data/download_dataset_stage1.py
 
 # Cache image embeddings for 10x faster training
-python src/cache_data.py
+python download_data/cache_data.py
 
 ```
 
@@ -32,7 +32,7 @@ This stage fine-tunes the **Locator** and the **LLM** using the augmented Signat
 
 ```bash
 # Download, Augment (3x), and Format the signature dataset
-python src/prepare_and_augment.py
+python download_data/prepare_and_augment.py
 
 ```
 
