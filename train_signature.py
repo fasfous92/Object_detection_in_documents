@@ -12,7 +12,7 @@ from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler # <--- 1. IMPORT AMP
 
 from src.model import RODMLLM
-from src.ingestion import RealDataCollator 
+from utils.ingestion import RealDataCollator 
 
 # --- DATASET ---
 class SignatureDataset(Dataset):

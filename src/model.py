@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM, CLIPVisionModel, BitsAndBytesConfig
-from src.locator import LowLevelLocator
+from utils.locator import LowLevelLocator
 
 class RODMLLM(nn.Module):
     def __init__(self, llm_model_id="lmsys/vicuna-7b-v1.5", device="cuda"):
