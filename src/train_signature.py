@@ -24,15 +24,49 @@ class SignatureDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-    def __getitem__(self, idx):
+ def __getitem__(self, idx):
         item = self.data[idx]
         image_path = os.path.join(self.image_folder, item["file_name"])
         
         try:
             image = Image.open(image_path).convert("RGB")
+            w_orig, h_orig = image.size
+            
+            # --- DELETE THE RESIZE HACK ---
+            # Was: image = image.resize((512, 512)) 
+            # New: Pass the original image. The processor will resize it intelligently.
+            
         except:
             return self.__getitem__((idx + 1) % len(self.data))
 
+        # ... (rest of normalization logic uses w_orig, h_orig which is correct) ...
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image}, # Pass full image
+                    {"type": "text", "text": "Detect the signature. Output JSON [ymin, xmin, ymax, xmax] (0-1000 scale)."},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": target_text,
+            }
+        ]
+
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        image_inputs, video_inputs = process_vision_info(messages)
+        
+        inputs = self.processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding="max_length", 
+            max_length=1024, # <--- INCREASED to 1024 to fit the larger image tokens
+            truncation=True,
+            return_tensors="pt",
+        )
         return {
             "image": image, 
             "boxes": torch.tensor(item["boxes"]), 

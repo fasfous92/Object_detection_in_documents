@@ -1,94 +1,56 @@
-# Object Detection in Documents (ROD-MLLM)
+# Signature Detection with Qwen2.5-VL
 
-This project implements a **Retrieval-based Object Detection Multimodal LLM (ROD-MLLM)** specialized for detecting signatures in scanned documents. It combines a vision encoder (CLIP), an open-vocabulary locator (OWLv2), and a large language model (Vicuna) to achieve precise localization and contextual understanding.
+This repository implements a signature detection pipeline using the **Qwen2.5-VL** Vision-Language Model. It includes a complete workflow for dataset preparation, fine-tuning (optional), and robust evaluation.
 
-## Implementation Phase
+## 🚀 Quick Start
 
-### 1. Environment Setup
-Install the necessary dependencies to run the training and inference scripts.
+### Instalation
+
+**Create virtual env**: use the requirement.txt to create and activate the python env
+
+
+### 1. Prepare the Dataset
+
+**Before running any notebooks**, you must run the data preparation script. This script handles:
+
+1. Downloading the raw dataset from Roboflow.
+2. Aggregating all images (ignoring original splits).
+3. Creating a custom **70% Train / 20% Valid / 10% Test** split.
+4. Applying **3x Augmentation** (Rotation, Noise, Perspective) **only** to the training set.
+5. Formatting annotations into the required JSONL format.
+
 ```bash
-pip install -r requirements.txt
+# Run this once to generate the 'data/' folder
+python  python download_data/download_signature_data.py
 
 ```
 
-### 2. Data Preparation
+### 2. Run the Notebook
 
-The training pipeline consists of two stages. You must download and prepare the data for each stage separately.
+Once the `data/` folder is generated, the Jupyter Notebook usage is straightforward. It will automatically load the test set and run the evaluation pipeline.
 
-**Stage 1: Alignment (Projector Pre-training)**
-This stage aligns the visual encoder (CLIP) with the LLM using the COCO dataset. The model learns to map visual features to text embeddings.
+---
 
-```bash
-# Download COCO dataset
-python download_data/download_dataset_stage1.py
+## 📊 Evaluation Metrics
 
-# Cache image embeddings for 10x faster training
-python download_data/cache_data.py
+Standard object detection metrics often fail to capture the nuances of signature detection (e.g., human annotators drawing loose boxes vs. models drawing tight boxes).
 
-```
+To get a true picture of performance, we use a composite of three metrics:
 
-**Stage 2: Fine-Tuning (Signature Detection)**
-This stage fine-tunes the **Locator** and the **LLM** using the augmented Signature dataset (Tobacco800 + DL-Signatures). The script downloads the data from Roboflow and applies augmentation (noise, blur, rotation).
+### 1. IoU (Intersection over Union)
 
-```bash
-# Download, Augment (3x), and Format the signature dataset
-python download_data/prepare_and_augment.py
+* **What it is:** The standard academic metric measuring absolute pixel overlap.
+* **Why we use it:** To compare against standard benchmarks.
+* **Limitation:** It unfairly penalizes "tight crops" where the model ignores white space that a human annotator included.
 
-```
+### 2. IoP (Intersection over Prediction)
 
-*Note: This creates the `data/signatures_augmented` folder ready for training.*
+* **What it is:** Measures how much of the *prediction* is inside the Ground Truth.
+* **Why we use it:** This is our **Precision / Tightness** score.
+* **Interpretation:** A score of **1.0** means the predicted box is perfectly inside the ground truth. This confirms the model found the signature and didn't hallucinate background pixels, solving the "conservative annotation" bias.
 
-### 3. Training Stage 1 (Alignment)
+### 3. Normalized Center Distance
 
-Train the **Projectors** (MLP) to connect the frozen Vision Encoder to the frozen LLM. This establishes the "vision-language" communication channel.
-
-```bash
-python -m src.train \
-    --stage 1 \
-    --epochs 2 \
-    --batch_size 32 \
-    --lr 1e-3
-
-```
-
-### 4. Training Stage 2 (Signature Fine-Tuning)
-
-Train the **Locator (OWLv2)** and **LLM (LoRA)**.
-
-* **Unfreezes the Locator:** Allows the model to adapt to document-specific noise (scans, blur, paper texture).
-* **Instruction Tuning:** Teaches the LLM to specifically look for "signatures" rather than generic objects.
-
-```bash
-python -m src.train_signature \
-    --stage 2 \
-    --train_annotation data/signatures_augmented/rod_train.json \
-    --val_annotation data/signatures_augmented/rod_valid.json \
-    --image_dir data/signatures_augmented/images \
-    --resume output_model/stage1_epoch2.pt \
-    --epochs 5 \
-    --lr 1e-5 \
-    --per_device_batch_size 2 \
-    --target_batch_size 32
-
-```
-
-*Arguments:*
-
-* `--resume`: Points to the best checkpoint from Stage 1.
-* `--lr 1e-5`: Uses a lower learning rate to stabilize the fine-tuning of the sensitive Locator module.
-
-### 5. Evaluation & Visualization
-
-Run inference on the test set to calculate the Mean IoU and generate visualization plots.
-
-```bash
-python -m src.test_signature
-
-```
-
-**Output:**
-
-* **Console:** Prints the final Mean IoU score.
-* **Visuals:** Check the `results/` folder for:
-* `best_predictions.png`: Top 5 accurate detections (Green = Truth, Red = Prediction).
-* `worst_predictions.png`: Bottom 5 failing cases (useful for debugging).
+* **What it is:** The distance between the center of the predicted box and the ground truth, divided by the image diagonal.
+* **Why we use it:** This measures **Localization Error** independent of box size.
+* **Interpretation:** A value of **0.05** means the prediction is off by only **5%** relative to the image size. This proves the model is looking at the right location, even if the box shape isn't perfect.
