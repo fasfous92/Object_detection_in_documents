@@ -37,3 +37,4 @@ pycocotools
 roboflow
 albumentations
 dotenv
+litellm
