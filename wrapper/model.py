@@ -24,13 +24,11 @@ class Model(ABC):
         pass
 
     @abstractmethod
-    def postprocess(self, raw_results, img_h: int = None, img_w: int = None) -> List[Dict]:
-        """
-        img_h, img_w: Optional dimensions used to denormalize coordinates smartly.
-        """
+    def postprocess(self, raw_results: List[Dict], img_h: int, img_w: int, normalize: bool = True) -> List[Dict]:
+        """Converts raw model output into a standardized list of dicts with pixel coordinates."""
         pass
 
-    def plot_bounding_boxes(self, image_path, bbox_data, height, width, ground_truth=None,normalize=True):
+    def plot_bounding_boxes(self, image_path, bbox_data, height, width, ground_truth=None):
         """
         Plots bounding boxes assuming Qwen-style format: [xmin, ymin, xmax, ymax] (0-1000).
         
@@ -59,25 +57,18 @@ class Model(ABC):
         # 3. Plot Predictions (Red)
         # Assumes bbox_data is: [xmin, ymin, xmax, ymax] in 0-1000 scale
         for item in bbox_data:
-            bbox = item.get('bbox_2d', [])
+            bbox = item.get('box_2d', [])
             label = item.get('label', 'object')
             
             if len(bbox) != 4: continue
 
             # SCALING LOGIC: 0-1000 -> Pixel Coordinate (width/height)
             # x_pixel = (x_1000 / 1000) * width
-          
-            if normalize:
-                x_min = (bbox[0]/1000) * width
-                y_min = (bbox[1]/1000) * height
-                x_max = (bbox[2]/1000) * width
-                y_max = (bbox[3]/1000) * height
-            else: 
-                x_min = bbox[0]
-                y_min = bbox[1] 
-                x_max = bbox[2]
-                y_max = bbox[3]
-                
+            x_min = bbox[0]
+            y_min = bbox[1] 
+            x_max = bbox[2]
+            y_max = bbox[3]
+            
             # Calculate width/height for Matplotlib Rectangle
             box_w = x_max - x_min
             box_h = y_max - y_min

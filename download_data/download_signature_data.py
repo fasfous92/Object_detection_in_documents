@@ -18,7 +18,7 @@ WORKSPACE = "tech-ysdkk"
 PROJECT = "signature-detection-hlx8j"
 VERSION = 3 
 
-# Split Ratios (Must add up to 1.0)
+# Split Ratios
 TRAIN_RATIO = 0.70
 VALID_RATIO = 0.20
 TEST_RATIO  = 0.10
@@ -73,15 +73,8 @@ def safe_clip_boxes(boxes, img_w, img_h):
     return cleaned
 
 def aggregate_all_data(base_path):
-    """
-    Looks inside the downloaded path for ANY train/valid/test folders
-    and merges them into a single list of samples.
-    """
     print(f">> Aggregating data from {base_path}...")
     all_samples = []
-    
-    # Roboflow structure usually has 'train', 'valid', 'test' folders
-    # But sometimes it's flat. We check common subfolders.
     subfolders = ["train", "valid", "test", "."]
     
     for folder in subfolders:
@@ -91,22 +84,18 @@ def aggregate_all_data(base_path):
         if not os.path.exists(json_path):
             continue
             
-        # Load COCO JSON
         with open(json_path, 'r') as f:
             coco = json.load(f)
             
-        # Create a map: image_id -> list of bboxes
         ann_map = {}
         for ann in coco['annotations']:
             ann_map.setdefault(ann['image_id'], []).append(ann['bbox'])
             
-        # Iterate images in this split
         for img_info in coco['images']:
             img_id = img_info['id']
             file_name = img_info['file_name']
             full_img_path = os.path.join(current_dir, file_name)
             
-            # Verify image exists
             if os.path.exists(full_img_path):
                 boxes = ann_map.get(img_id, [])
                 if boxes:
@@ -121,7 +110,7 @@ def aggregate_all_data(base_path):
 
 def process_and_save(samples, split_name):
     """
-    Augments (if train) and saves to JSONL format.
+    Augments and saves to JSONL in the Qwen2-VL chat format.
     """
     entries = []
     is_train = (split_name == "train")
@@ -141,7 +130,6 @@ def process_and_save(samples, split_name):
         if not cleaned_boxes: continue
         
         for i in range(aug_factor):
-            # Keep original on first pass, augment on others (only for train)
             if i == 0 or not is_train:
                 final_img, final_boxes = image, cleaned_boxes
                 suffix = "orig"
@@ -161,24 +149,53 @@ def process_and_save(samples, split_name):
             out_path = os.path.join(FINAL_IMG_DIR, out_name)
             cv2.imwrite(out_path, cv2.cvtColor(final_img, cv2.COLOR_RGB2BGR))
             
-            # Format JSON Output (The target label)
-            json_targets = []
+            # --- 🚀 THE FIX: Qwen2-VL Formatted Targets ---
+            qwen_bboxes_text = []
+            
             for b in final_boxes:
                 bx, by, bw, bh = b
-                bbox_2d = [int(bx), int(by), int(bx + bw), int(by + bh)]
-                json_targets.append({
-                    "bbox_2d": bbox_2d,
-                    "label": "signatures"
-                })
+                
+                x1, y1 = bx, by
+                x2, y2 = bx + bw, by + bh
+                
+                # Normalize to 0-1000
+                x1_n = int((x1 / w) * 1000)
+                y1_n = int((y1 / h) * 1000)
+                x2_n = int((x2 / w) * 1000)
+                y2_n = int((y2 / h) * 1000)
+                
+                # Clip safely
+                x1_n, y1_n = max(0, min(1000, x1_n)), max(0, min(1000, y1_n))
+                x2_n, y2_n = max(0, min(1000, x2_n)), max(0, min(1000, y2_n))
+                
+                # Qwen uses (ymin, xmin), (ymax, xmax)
+                box_str = f"<|box_start|>({y1_n},{x1_n}),({y2_n},{x2_n})<|box_end|> signature"
+                qwen_bboxes_text.append(box_str)
             
-            label_str = json.dumps(json_targets)
+            # Join all bounding boxes found in the image
+            assistant_response = "".join(qwen_bboxes_text)
             
-            entries.append({
-                "image": f"images/{out_name}",
-                "label": label_str
-            })
+            # Build the chat format dictionary
+            entry = {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": os.path.abspath(out_path)}, 
+                            {"type": "text", "text": "Locate the signature."}
+                        ]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": assistant_response}
+                        ]
+                    }
+                ]
+            }
             
-    # Write JSONL
+            entries.append(entry)
+            
     out_jsonl = os.path.join(OUTPUT_DIR, f"{split_name}.jsonl")
     with open(out_jsonl, 'w') as f:
         for e in entries:
@@ -189,19 +206,16 @@ def process_and_save(samples, split_name):
 def run_pipeline():
     setup_dirs()
     
-    # 1. Download Data
     dataset_location = download_data()
     if not dataset_location:
         return
 
-    # 2. Aggregate everything into one list (ignoring original splits)
     all_data = aggregate_all_data(dataset_location)
     
     if not all_data:
         print("Error: No data found after download.")
         return
 
-    # 3. Shuffle and Split Manually
     random.shuffle(all_data)
     
     total = len(all_data)
@@ -214,7 +228,6 @@ def run_pipeline():
     
     print(f">> Split Plan: Train={len(train_samples)}, Valid={len(valid_samples)}, Test={len(test_samples)}")
     
-    # 4. Process and Save
     n_train = process_and_save(train_samples, "train")
     n_valid = process_and_save(valid_samples, "valid")
     n_test  = process_and_save(test_samples, "test")

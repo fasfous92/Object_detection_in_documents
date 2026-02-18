@@ -209,3 +209,4 @@ __marimo__/
 data/
 output_model/
 output/*
+qwen2.5-vl-signature-detector/
