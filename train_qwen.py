@@ -4,53 +4,40 @@ import json
 import torch
 from datasets import Dataset 
 from transformers import (
-    Qwen2_5_VLForConditionalGeneration,
-    AutoProcessor,
+    EarlyStoppingCallback,
     TrainingArguments
 )
 from peft import LoraConfig, get_peft_model, PeftModel # <-- Added PeftModel
 from trl import SFTTrainer
 from qwen_vl_utils import process_vision_info
+from wrapper.Qwen_25_LLM import Qwen_llm
+
 
 # --- 1. CONFIGURATION ---
 LOCAL_MODEL_PATH = "Qwen/Qwen2.5-VL-3B-Instruct" 
-OUTPUT_DIR = "qwen2.5-vl-signature-detector"
+OUTPUT_DIR = "./qwen2.5-vl-signature-detector"
 TRAIN_DATA = "data/train.jsonl"
 VALID_DATA = "data/valid.jsonl"
 
-# 🔄 NEW: Set this to the path of your saved adapter to continue training it. 
-# Set to None (or an empty string) if you want to train from scratch.
-RESUME_ADAPTER_PATH = "./qwen2.5-vl-signature-detector" # e.g., your previously saved output dir
+RESUME_ADAPTER_PATH = "./qwen2.5-vl-signature-detector" # Leave empty string "" if starting from scratch
 
-# --- 2. LOAD PROCESSOR & BASE MODEL ---
-print(f"⏳ Loading Processor from {LOCAL_MODEL_PATH}...")
-processor = AutoProcessor.from_pretrained(
-    LOCAL_MODEL_PATH,
-    max_pixels=448 * 28 * 28, 
-    # Removed local_files_only=True so it can successfully pull from the HF cache/hub
-)
+# --- 2. LOAD MODEL VIA WRAPPER ---
+# Initialize the wrapper
+qwen_wrapper = Qwen_llm(base_model_path=LOCAL_MODEL_PATH, adapter_path=RESUME_ADAPTER_PATH)
 
-print(f"⏳ Loading Base Model (Qwen2.5-VL) from {LOCAL_MODEL_PATH}...")
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    LOCAL_MODEL_PATH,
-    torch_dtype=torch.bfloat16,
-    device_map="auto",
-    attn_implementation="flash_attention_2", 
-    # Removed local_files_only=True 
-)
+# Load it in training mode! 
+# This automatically handles model.train() and PeftModel's is_trainable flag.
+qwen_wrapper.load(is_trainable=True)
 
-# --- 3. LORA CONFIGURATION (NEW LOGIC) ---
-# If an adapter path is provided AND the folder exists, load it for further training
-if RESUME_ADAPTER_PATH and os.path.exists(RESUME_ADAPTER_PATH):
-    print(f"🔄 Loading EXISTING LoRA adapter from {RESUME_ADAPTER_PATH} for continued training...")
-    # is_trainable=True is CRITICAL. Without it, the weights will be frozen for inference.
-    model = PeftModel.from_pretrained(model, RESUME_ADAPTER_PATH, is_trainable=True)
-    model.print_trainable_parameters()
-else:
+# Extract the processor for the collator
+processor = qwen_wrapper.processor
+
+# --- 3. LORA CONFIGURATION ---
+if not (RESUME_ADAPTER_PATH and os.path.exists(RESUME_ADAPTER_PATH)):
     print("⚙️ Configuring NEW LoRA adapter from scratch...")
     lora_config = LoraConfig(
-        r=8,
-        lora_alpha=64,
+        r=16,
+        lora_alpha=32,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj"
@@ -59,9 +46,14 @@ else:
         lora_dropout=0.05,
         bias="none"
     )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
-
+    
+    # YOUR FIX: Reassign the wrapped PEFT model directly back to the wrapper's property
+    qwen_wrapper.model = get_peft_model(qwen_wrapper.model, lora_config)
+    qwen_wrapper.model.print_trainable_parameters()
+else:
+    # It was already loaded as a trainable PeftModel by your wrapper!
+    qwen_wrapper.model.print_trainable_parameters()
+    
 # --- 4. DATASET & COLLATOR ---
 print("📂 Loading datasets...")
 
@@ -118,27 +110,33 @@ training_args = TrainingArguments(
     per_device_train_batch_size=1, 
     per_device_eval_batch_size=1,
     gradient_accumulation_steps=8, 
-    num_train_epochs=3,
-    learning_rate=2e-5,
+    num_train_epochs=10,
+    learning_rate=2e-4, 
     bf16=True, 
     logging_steps=10, 
     dataloader_num_workers=4, 
     dataloader_prefetch_factor=2, 
-    eval_strategy="epoch",
-    save_strategy="epoch",
-    save_total_limit=2,
+    
+    # --- BEST MODEL SELECTION LOGIC ---
+    eval_strategy="epoch",          # Evaluate at the end of each epoch
+    save_strategy="epoch",          # Save a checkpoint at the end of each epoch (Must match eval_strategy)
+    save_total_limit=3,             # Keep the last 3 checkpoints to save disk space
+    load_best_model_at_end=True,    # 🚀 Load the best model at the end of training
+    metric_for_best_model="eval_loss", # 🚀 Use validation loss to judge "best"
+    greater_is_better=False,        # 🚀 Lower validation loss is better
+    
     remove_unused_columns=False, 
     report_to="none" 
 )
-
 # --- 6. SFT TRAINER ---
-print("🚀 Initializing SFTTrainer...")
+print("🚀 Initializing SFTTrainer with Early Stopping...")
 trainer = SFTTrainer(
-    model=model,
+    model=qwen_wrapper.model,
     args=training_args,
     train_dataset=train_dataset,
     eval_dataset=valid_dataset,
     data_collator=qwen_collate_fn,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=2)] # 🚀 ADD THIS LINE
 )
 
 # --- 7. TRAIN & SAVE ---
