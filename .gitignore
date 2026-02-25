@@ -210,3 +210,6 @@ data/
 output_model/
 output/*
 qwen2.5-vl-signature-detector/
+pdf_to_image/
+data_signature_only/
+old_scripts/

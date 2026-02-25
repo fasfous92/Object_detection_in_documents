@@ -19,7 +19,7 @@ OUTPUT_DIR = "./qwen2.5-vl-signature-detector"
 TRAIN_DATA = "data/train.jsonl"
 VALID_DATA = "data/valid.jsonl"
 
-RESUME_ADAPTER_PATH = "./qwen2.5-vl-signature-detector" # Leave empty string "" if starting from scratch
+RESUME_ADAPTER_PATH =None # "./qwen2.5-vl-signature-detector" # Leave empty string "" if starting from scratch
 
 # --- 2. LOAD MODEL VIA WRAPPER ---
 # Initialize the wrapper
@@ -32,6 +32,10 @@ qwen_wrapper.load(is_trainable=True)
 # Extract the processor for the collator
 processor = qwen_wrapper.processor
 
+#limite pixel size
+processor.image_processor.max_pixels = 602112 #776*776
+processor.image_processor.min_pixels = 313600 #560*560
+
 # --- 3. LORA CONFIGURATION ---
 if not (RESUME_ADAPTER_PATH and os.path.exists(RESUME_ADAPTER_PATH)):
     print("⚙️ Configuring NEW LoRA adapter from scratch...")
@@ -40,7 +44,9 @@ if not (RESUME_ADAPTER_PATH and os.path.exists(RESUME_ADAPTER_PATH)):
         lora_alpha=32,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj"
+            "gate_proj", "up_proj", "down_proj",
+            
+            "visual.merger.mlp.0", "visual.merger.mlp.2"
         ],
         task_type="CAUSAL_LM",
         lora_dropout=0.05,
@@ -67,8 +73,11 @@ valid_list = load_jsonl(VALID_DATA)
 train_dataset = Dataset.from_list(train_list)
 valid_dataset = Dataset.from_list(valid_list)
 
+
 def qwen_collate_fn(examples):
     cleaned_messages_list = []
+    
+    # 1. Clean the incoming JSON dictionaries to remove None values
     for example in examples:
         clean_messages = []
         for msg in example["messages"]:
@@ -79,13 +88,16 @@ def qwen_collate_fn(examples):
             clean_messages.append({"role": msg["role"], "content": clean_content})
         cleaned_messages_list.append(clean_messages)
         
+    # 2. Extract image and video paths/arrays using Qwen's utility
     image_inputs, video_inputs = process_vision_info(cleaned_messages_list)
     
+    # 3. Apply the Chat Template (injects <|im_start|> user ... <|im_start|> assistant ...)
     texts = [
         processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=False) 
         for msg in cleaned_messages_list
     ]
     
+    # 4. Process everything into padded PyTorch tensors
     batch = processor(
         text=texts,
         images=image_inputs,
@@ -94,13 +106,42 @@ def qwen_collate_fn(examples):
         return_tensors="pt"
     )
     
+    # 5. Initialize labels as a clone of input_ids
     labels = batch["input_ids"].clone()
+    
+    # 6. Mask padding tokens so they don't contribute to the loss gradient
     labels[labels == processor.tokenizer.pad_token_id] = -100
     
-    image_token_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-    if image_token_id is not None:
-        labels[labels == image_token_id] = -100
+    # 7. 🚀 FIX: Mask ALL vision-related tokens so the model doesn't try to predict the image sequence
+    vision_tokens = ["<|image_pad|>", "<|vision_start|>", "<|vision_end|>"]
+    for token in vision_tokens:
+        token_id = processor.tokenizer.convert_tokens_to_ids(token)
+        if token_id is not None:
+            labels[labels == token_id] = -100
+            
+    # 8. FAST PROMPT MASKING (Tensor sliding window)
+    # We locate the exact start of the assistant's response to mask the user's prompt
+    assistant_prefix = processor.tokenizer("<|im_start|>assistant\n", add_special_tokens=False).input_ids
+    prefix_len = len(assistant_prefix)
+    prefix_tensor = torch.tensor(assistant_prefix, device=labels.device)
+
+    for i in range(labels.shape[0]):
+        seq = labels[i]
         
+        # Unfold creates a sliding window view of the tensor
+        windows = seq.unfold(0, prefix_len, 1)
+        
+        # Check where the sliding window exactly matches the assistant_prefix sequence
+        matches = (windows == prefix_tensor).all(dim=1)
+        match_indices = matches.nonzero(as_tuple=True)[0]
+        
+        if len(match_indices) > 0:
+            # The actual target tokens start AFTER the prefix
+            match_idx = match_indices[0].item() + prefix_len
+            
+            # Mask everything from index 0 up to the start of the assistant's response
+            labels[i, :match_idx] = -100 
+            
     batch["labels"] = labels
     return batch
 
@@ -110,12 +151,14 @@ training_args = TrainingArguments(
     per_device_train_batch_size=1, 
     per_device_eval_batch_size=1,
     gradient_accumulation_steps=8, 
-    num_train_epochs=10,
-    learning_rate=2e-4, 
+    num_train_epochs=3,
+    learning_rate=5e-5,
     bf16=True, 
     logging_steps=10, 
     dataloader_num_workers=4, 
     dataloader_prefetch_factor=2, 
+    gradient_checkpointing=True, # 🚀 ADD THIS: Drastically reduces VRAM
+    gradient_checkpointing_kwargs={"use_reentrant": False},
     
     # --- BEST MODEL SELECTION LOGIC ---
     eval_strategy="epoch",          # Evaluate at the end of each epoch

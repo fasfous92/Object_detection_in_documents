@@ -66,18 +66,30 @@ class Qwen_llm:
         self.processor = AutoProcessor.from_pretrained(processor_path)
         print("✅ Model and Processor loaded successfully.")
 
-    def predict(self, image_path, prompt="Locate the signature."):
+    def predict(self, image_path, prompt="Detect all signatures and stamps. Output a JSON list with 'bbox' [ymin, xmin, ymax, xmax] and 'label'."):
         """
-        Takes an image and a text prompt, runs the forward pass, and returns the raw text output.
+        End-to-end inference:
+        1. Reads original dimensions for post-processing.
+        2. Passes the raw image path directly to Qwen (letting max_pixels handle safe scaling).
+        3. Delegates the coordinate mapping to self.postprocess().
         """
         if not self.model or not self.processor:
             raise RuntimeError("Model is not loaded. Call load() first.")
 
+        # --- 1. GET ORIGINAL DIMENSIONS ---
+        # We only use cv2 here to get the true W and H for the postprocess math.
+        orig_img = cv2.imread(image_path)
+        if orig_img is None:
+            raise ValueError(f"Could not read image at: {image_path}")
+        
+        original_height, original_width = orig_img.shape[:2]
+
+        # --- 2. FORWARD PASS ---
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": image_path},
+                    {"type": "image", "image": image_path}, # Feed the RAW image path!
                     {"type": "text", "text": prompt}
                 ]
             }
@@ -97,79 +109,184 @@ class Qwen_llm:
         with torch.inference_mode():
             generated_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=100,
-                do_sample=False
+                max_new_tokens=256, # Increased to prevent cutting off long JSON lists
+                do_sample=False,
+                temperature=0.0     # Forces strict, uncreative JSON output
             )
 
-        # Isolate the newly generated tokens
+        # Isolate newly generated tokens
         generated_ids_trimmed = [
             out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
 
+        # Decode the raw text output
         output_text = self.processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=False, clean_up_tokenization_spaces=False
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
         
-        return output_text
+        # --- 3. POST-PROCESSING (Mapping back to HD) ---
+        # Ensure is_ground_truth is False so it strips markdown/stop tokens
+        pixel_boxes = self.postprocess(
+            raw_output=output_text, 
+            original_width=original_width, 
+            original_height=original_height,
+            is_ground_truth=False
+        )
 
-    def postprocess(self, raw_output, image_width, image_height):
+        return {
+            "boxes": pixel_boxes, 
+            "raw_text": output_text
+        }
+
+
+    def postprocess(self, raw_output, original_width, original_height, is_ground_truth=False):
         """
-        Extracts Qwen's normalized coordinates and converts them to absolute pixel bounding boxes.
-        Returns a list of [x1, y1, x2, y2] pixel coordinates.
-        """
-        pattern = r"<\|box_start\|>\((\d+),(\d+)\),\((\d+),(\d+)\)<\|box_end\|>"
-        matches = re.findall(pattern, raw_output)
+        Extracts JSON structured bounding boxes and converts them to absolute pixel coordinates.
         
-        pixel_boxes = []
-        for match in matches:
-            y1_n, x1_n, y2_n, x2_n = map(int, match)
+        Args:
+            raw_output (str): The raw text output (e.g., '[{"bbox":...}]<|im_end|>') or clean GT JSON.
+            original_width (int): The width of the original, un-resized document.
+            original_height (int): The height of the original, un-resized document.
+            is_ground_truth (bool): If True, bypasses LLM-specific text cleaning.
             
-            # Convert from [0, 1000] scale to actual pixels
-            x1 = int((x1_n / 1000) * image_width)
-            y1 = int((y1_n / 1000) * image_height)
-            x2 = int((x2_n / 1000) * image_width)
-            y2 = int((y2_n / 1000) * image_height)
+        Returns:
+            list: A list of dictionaries containing 'bbox' [x1, y1, x2, y2] and 'label'.
+        """
+        if not is_ground_truth:
+            # 1. Clean the raw output (Predictions ONLY)
+            clean_output = raw_output.strip()
             
-            pixel_boxes.append([x1, y1, x2, y2])
+            # Strip Qwen's specific stop tokens
+            clean_output = clean_output.replace("<|im_end|>", "").strip()
+            clean_output = clean_output.replace("<|endoftext|>", "").strip()
             
-        return pixel_boxes
-
-    def plot_bounding_boxes(self, image_path, predictions, ground_truths=None, save_path=None):
+            # Handle the case where the model hallucinates markdown JSON wrappers
+            if clean_output.startswith("```json"):
+                clean_output = clean_output[7:]
+            if clean_output.endswith("```"):
+                clean_output = clean_output[:-3]
+                
+            clean_output = clean_output.strip()
+        else:
+            # Ground truth is already clean
+            clean_output = raw_output.strip()
+        
+        # 2. Parse the JSON string
+        try:
+            detections = json.loads(clean_output)
+        except json.JSONDecodeError as e:
+            prefix = "Ground Truth" if is_ground_truth else "Prediction"
+            print(f"Warning: Failed to parse {prefix} JSON. Error: {e}")
+            print(f"Raw output was: {raw_output}")
+            return []
+            
+        pixel_results = []
+        
+        if not isinstance(detections, list) or len(detections) == 0:
+            return pixel_results
+            
+        # 3. Process each detection
+        for det in detections:
+            bbox = det.get("bbox", [])
+            label = det.get("label", "unknown")
+            
+            if len(bbox) != 4:
+                continue
+                
+            # Qwen JSON format ordering: [ymin, xmin, ymax, xmax] on a 0-1000 scale
+            y1_n, x1_n, y2_n, x2_n = bbox
+            
+            # 4. Un-normalize back to original dimensions
+            x1 = int((x1_n / 1000.0) * original_width)
+            y1 = int((y1_n / 1000.0) * original_height)
+            x2 = int((x2_n / 1000.0) * original_width)
+            y2 = int((y2_n / 1000.0) * original_height)
+            
+            # 5. Safety Check: Clip to image boundaries
+            x1 = max(0, min(original_width - 1, x1))
+            y1 = max(0, min(original_height - 1, y1))
+            x2 = max(0, min(original_width - 1, x2))
+            y2 = max(0, min(original_height - 1, y2))
+            
+            # 6. Ensure correct ordering (prevents inverted boxes)
+            x1, x2 = min(x1, x2), max(x1, x2)
+            y1, y2 = min(y1, y2), max(y1, y2)
+            
+            # Only append valid, non-zero area boxes
+            if (x2 - x1) > 0 and (y2 - y1) > 0:
+                pixel_results.append({
+                    "bbox": [x1, y1, x2, y2], 
+                    "label": label
+                })
+                
+        return pixel_results
+ 
+    def plot_bounding_boxes(self,image_path, predictions=None, ground_truths=None, save_path=None):
         """
         Visualizes the image, drawing predictions in Green and ground truths in Red.
+        Includes robust error handling for missing or malformed bounding boxes.
         """
         image = cv2.imread(image_path)
         if image is None:
             print(f"❌ Error: Could not load image at {image_path}")
             return
             
+        # Convert to RGB for accurate color plotting in Matplotlib
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
+        # Safely handle None inputs
+        ground_truths = ground_truths or []
+        predictions = predictions or []
+
         # Plot Ground Truths (RED)
-        if ground_truths:
-            for gt_box in ground_truths:
-                x1, y1, x2, y2 = map(int, gt_box)
-                cv2.rectangle(image, (x1, y1), (x2, y2), (255, 0, 0), 3) # Red box
-                cv2.putText(image, "GT", (x1, max(y1 - 10, 10)), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+        for gt in ground_truths:
+            if isinstance(gt, dict):
+                bbox = gt.get("bbox", [])
+                label_text = f"GT: {gt.get('label', 'unknown')}"
+            else:
+                bbox = gt  # Fallback for old list format
+                label_text = "GT"
+                
+            # 🚀 THE FIX: Ensure we actually have 4 coordinates before unpacking
+            if len(bbox) != 4:
+                print(f"⚠️ Skipping malformed GT bbox: {bbox}")
+                continue
+                
+            x1, y1, x2, y2 = map(int, bbox)
+            cv2.rectangle(image, (x1, y1), (x2, y2), (255, 0, 0), 3) # Red box
+            cv2.putText(image, label_text, (x1, max(y1 - 10, 10)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
 
         # Plot Predictions (GREEN)
-        for pred_box in predictions:
-            x1, y1, x2, y2 = map(int, pred_box)
+        for pred in predictions:
+            if isinstance(pred, dict):
+                bbox = pred.get("bbox", [])
+                label_text = f"Pred: {pred.get('label', 'unknown')}"
+            else:
+                bbox = pred  # Fallback for old list format
+                label_text = "Pred"
+                
+            # 🚀 THE FIX: Ensure we actually have 4 coordinates before unpacking
+            if len(bbox) != 4:
+                print(f"⚠️ Skipping malformed Pred bbox: {bbox}")
+                continue
+                
+            x1, y1, x2, y2 = map(int, bbox)
             cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 3) # Green box
-            cv2.putText(image, "Pred", (x1, max(y1 - 10, 10)), 
+            cv2.putText(image, label_text, (x1, max(y1 - 10, 10)), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-        plt.figure(figsize=(12, 12))
-        plt.imshow(image)
-        plt.axis("off")
-        
+        # Save or Display
         if save_path:
-            plt.savefig(save_path, bbox_inches='tight')
+            # Convert back to BGR because OpenCV expects BGR for saving
+            image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(save_path, image_bgr)
             print(f"📸 Saved visualization to {save_path}")
         else:
+            plt.figure(figsize=(12, 12))
+            plt.imshow(image)
+            plt.axis("off")    
             plt.show()
-        return plt
 
     
     def evaluate(self,dataset) -> Dict:

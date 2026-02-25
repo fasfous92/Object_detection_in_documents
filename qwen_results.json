@@ -1,0 +1,110 @@
+[
+    {
+        "page": 1,
+        "file_name": "page_001.jpg",
+        "detected boxes": [
+            [
+                300,
+                1086,
+                597,
+                1181
+            ],
+            [
+                744,
+                1110,
+                1076,
+                1196
+            ]
+        ],
+        "raw_model_text": "<|box_start|>(647,250),(703,498)<|box_end|>signatures<|box_start|>(661,620),(712,897)<|box_end|>signatures<|im_end|>"
+    },
+    {
+        "page": 83,
+        "file_name": "page_083.jpg",
+        "detected boxes": [
+            [
+                155,
+                1285,
+                416,
+                1354
+            ],
+            [
+                493,
+                1293,
+                605,
+                1342
+            ]
+        ],
+        "raw_model_text": "<|box_start|>(764,130),(805,347)<|box_end|>signatures<|box_start|>(769,412),(798,505)<|box_end|>signatures<|im_end|>"
+    },
+    {
+        "page": 99,
+        "file_name": "page_099.jpg",
+        "detected boxes": [
+            [
+                160,
+                854,
+                355,
+                902
+            ],
+            [
+                493,
+                844,
+                604,
+                893
+            ]
+        ],
+        "raw_model_text": "<|box_start|>(508,134),(536,297)<|box_end|>signatures<|box_start|>(502,412),(531,505)<|box_end|>signatures<|im_end|>"
+    },
+    {
+        "page": 209,
+        "file_name": "page_209.jpg",
+        "detected boxes": [
+            [
+                125,
+                1141,
+                374,
+                1202
+            ],
+            [
+                490,
+                1131,
+                603,
+                1183
+            ],
+            [
+                695,
+                1150,
+                805,
+                1202
+            ]
+        ],
+        "raw_model_text": "<|box_start|>(678,105),(714,312)<|box_end|>signatures<|box_start|>(672,409),(703,503)<|box_end|>signatures<|box_start|>(683,580),(714,672)<|box_end|>signatures<|im_end|>"
+    },
+    {
+        "page": 211,
+        "file_name": "page_211.jpg",
+        "detected boxes": [
+            [
+                160,
+                1136,
+                442,
+                1225
+            ]
+        ],
+        "raw_model_text": "<|box_start|>(675,134),(728,369)<|box_end|>signatures<|im_end|>"
+    },
+    {
+        "page": 217,
+        "file_name": "page_217.jpg",
+        "detected boxes": [
+            [
+                143,
+                666,
+                353,
+                735
+            ]
+        ],
+        "raw_model_text": "<|box_start|>(397,120),(438,295)<|box_end|>signatures<|im_end|>"
+    }
+]
