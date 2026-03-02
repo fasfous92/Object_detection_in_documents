@@ -100,20 +100,24 @@ def process_set(samples, split_name):
             fname = f"{split_name}_{i}_{s['name']}"
             cv2.imwrite(os.path.join(FINAL_IMG_DIR, fname), cv2.cvtColor(curr_img, cv2.COLOR_RGB2BGR))
             
-            # Format JSON response
+            # 🚀 QWEN2.5-VL OPTIMIZATION: Absolute Pixels [xmin, ymin, xmax, ymax]
             res_list = []
             for b, l in zip(curr_boxes, curr_labels):
-                y1 = max(0, min(1000, int((b[1]/h)*1000)))
-                x1 = max(0, min(1000, int((b[0]/w)*1000)))
-                y2 = max(0, min(1000, int(((b[1]+b[3])/h)*1000)))
-                x2 = max(0, min(1000, int(((b[0]+b[2])/w)*1000)))
-                res_list.append({"bbox": [y1, x1, y2, x2], "label": CLASS_MAP.get(l, "signature")})
+                # COCO format is [x_min, y_min, width, height]
+                x_min = max(0, int(b[0]))
+                y_min = max(0, int(b[1]))
+                x_max = min(w, int(b[0] + b[2]))
+                y_max = min(h, int(b[1] + b[3]))
+                
+                # Using the standard 'bbox_2d' key
+                res_list.append({"bbox_2d": [x_min, y_min, x_max, y_max], "label": CLASS_MAP.get(l, "signature")})
             
             targets = ["signatures", "stamps"]
-            random.shuffle(targets) # Randomizes the order for every single image
-            prompt_text = f"Detect all {targets[0]} and {targets[1]}. Output a JSON list with 'bbox' [ymin, xmin, ymax, xmax] and 'label'. If none are found, output an empty list []."
-                        
+            random.shuffle(targets)
             
+            # 🚀 PROMPT UPDATED: Explicitly requesting 'bbox_2d' and the correct coordinate order
+            prompt_text = f"Detect all {targets[0]} and {targets[1]}. Output a JSON list with 'bbox_2d' [xmin, ymin, xmax, ymax] and 'label'. If none are found, output an empty list []."
+                        
             entries.append({
                 "messages": [
                     {"role": "user", "content": [
@@ -129,15 +133,12 @@ def process_set(samples, split_name):
 
 def run():
     setup_dirs()
-    # Download both datasets
     loc1 = download_project(PROJ1_WORKSPACE, PROJ1_NAME, PROJ1_VERSION, "data/raw_proj1")
     loc2 = download_project(PROJ2_WORKSPACE, PROJ2_NAME, PROJ2_VERSION, "data/raw_proj2")
     
-    # Extract based on new logic
     data1 = get_data_from_coco(loc1, negatives_only=False) 
-    data2 = get_data_from_coco(loc2, negatives_only=True) # only empty docs 
+    data2 = get_data_from_coco(loc2, negatives_only=True) 
     
-    # Stratify
     pos = [s for s in data2 if len(s["anns"]) > 0]
     neg = data1 + [s for s in data2 if len(s["anns"]) == 0]
     
@@ -150,6 +151,7 @@ def run():
     p_tr, p_va, p_te = split(pos)
     n_tr, n_va, n_te = split(neg)
     
+    # Process and build splits
     process_set(p_tr + n_tr, "train")
     process_set(p_va + n_va, "valid")
     process_set(p_te + n_te, "test")

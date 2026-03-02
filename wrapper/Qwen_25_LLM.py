@@ -39,7 +39,7 @@ class Qwen_llm:
             self.base_model_path,
             torch_dtype=torch.bfloat16,
             device_map="auto",
-            attn_implementation="flash_attention_2"
+            attn_implementation="sdpa" #"flash_attention_2"
         )
         
         processor_path = self.base_model_path
@@ -126,57 +126,49 @@ class Qwen_llm:
         
         # --- 3. POST-PROCESSING (Mapping back to HD) ---
         # Ensure is_ground_truth is False so it strips markdown/stop tokens
-        pixel_boxes = self.postprocess(
-            raw_output=output_text, 
-            original_width=original_width, 
-            original_height=original_height,
-            is_ground_truth=False
-        )
+        # pixel_boxes = self.postprocess(
+        #     raw_output=output_text, 
+        #     original_width=original_width, 
+        #     original_height=original_height,
+        #     is_ground_truth=False
+        # )
 
-        return {
-            "boxes": pixel_boxes, 
-            "raw_text": output_text
-        }
+        return  output_text,original_width, original_height
+    
 
-
-    def postprocess(self, raw_output, original_width, original_height, is_ground_truth=False):
+    def postprocess(self, raw_output, original_width, original_height, is_ground_truth=False, normalize=True):
         """
-        Extracts JSON structured bounding boxes and converts them to absolute pixel coordinates.
+        Extracts JSON structured bounding boxes, conditionally un-normalizes coordinates, 
+        and formats them for the SignatureBenchmark class.
         
         Args:
-            raw_output (str): The raw text output (e.g., '[{"bbox":...}]<|im_end|>') or clean GT JSON.
-            original_width (int): The width of the original, un-resized document.
-            original_height (int): The height of the original, un-resized document.
+            raw_output (str): The raw text output or clean GT JSON.
+            original_width (int): The width of the original document.
+            original_height (int): The height of the original document.
             is_ground_truth (bool): If True, bypasses LLM-specific text cleaning.
-            
-        Returns:
-            list: A list of dictionaries containing 'bbox' [x1, y1, x2, y2] and 'label'.
+            normalize (bool): If True, un-normalizes from 0-1000 scale to absolute pixels. 
+                            If False, treats inputs as absolute pixels.
         """
+        clean_output = raw_output.strip()
+        
         if not is_ground_truth:
-            # 1. Clean the raw output (Predictions ONLY)
-            clean_output = raw_output.strip()
-            
-            # Strip Qwen's specific stop tokens
+            # Strip specific stop tokens
             clean_output = clean_output.replace("<|im_end|>", "").strip()
             clean_output = clean_output.replace("<|endoftext|>", "").strip()
             
-            # Handle the case where the model hallucinates markdown JSON wrappers
+            # Handle markdown JSON wrappers
             if clean_output.startswith("```json"):
                 clean_output = clean_output[7:]
             if clean_output.endswith("```"):
                 clean_output = clean_output[:-3]
                 
             clean_output = clean_output.strip()
-        else:
-            # Ground truth is already clean
-            clean_output = raw_output.strip()
         
-        # 2. Parse the JSON string
         try:
             detections = json.loads(clean_output)
         except json.JSONDecodeError as e:
             prefix = "Ground Truth" if is_ground_truth else "Prediction"
-            print(f"Warning: Failed to parse {prefix} JSON. Error: {e}")
+            print(f"⚠️ Warning: Failed to parse {prefix} JSON. Error: {e}")
             print(f"Raw output was: {raw_output}")
             return []
             
@@ -185,30 +177,36 @@ class Qwen_llm:
         if not isinstance(detections, list) or len(detections) == 0:
             return pixel_results
             
-        # 3. Process each detection
         for det in detections:
-            bbox = det.get("bbox", [])
+            bbox = det.get("bbox_2d", det.get("bbox", []))
             label = det.get("label", "unknown")
             
             if len(bbox) != 4:
                 continue
                 
-            # Qwen JSON format ordering: [ymin, xmin, ymax, xmax] on a 0-1000 scale
-            y1_n, x1_n, y2_n, x2_n = bbox
+            # Unpack directly as [xmin, ymin, xmax, ymax]
+            x1_n, y1_n, x2_n, y2_n = bbox
             
-            # 4. Un-normalize back to original dimensions
-            x1 = int((x1_n / 1000.0) * original_width)
-            y1 = int((y1_n / 1000.0) * original_height)
-            x2 = int((x2_n / 1000.0) * original_width)
-            y2 = int((y2_n / 1000.0) * original_height)
+            # ---------------------------------------------------------
+            # THE FIX: Conditional Normalization
+            # ---------------------------------------------------------
+            if normalize:
+                # Un-normalize back to original dimensions (Assuming 0-1000 scale)
+                x1 = int((x1_n / 1000.0) * original_width)
+                y1 = int((y1_n / 1000.0) * original_height)
+                x2 = int((x2_n / 1000.0) * original_width)
+                y2 = int((y2_n / 1000.0) * original_height)
+            else:
+                # Treat values directly as absolute pixels
+                x1, y1, x2, y2 = int(x1_n), int(y1_n), int(x2_n), int(y2_n)
             
-            # 5. Safety Check: Clip to image boundaries
+            # Safety Check: Clip to image boundaries (applies to both modes)
             x1 = max(0, min(original_width - 1, x1))
             y1 = max(0, min(original_height - 1, y1))
             x2 = max(0, min(original_width - 1, x2))
             y2 = max(0, min(original_height - 1, y2))
             
-            # 6. Ensure correct ordering (prevents inverted boxes)
+            # Ensure correct ordering (prevents inverted boxes mathematically)
             x1, x2 = min(x1, x2), max(x1, x2)
             y1, y2 = min(y1, y2), max(y1, y2)
             
