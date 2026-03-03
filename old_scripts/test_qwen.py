@@ -1,227 +1,129 @@
 import torch
-import argparse
-import os
-import json
 import re
-import matplotlib
-matplotlib.use('Agg') # Safe for servers/headless environments
+import cv2
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from PIL import Image
-from tqdm import tqdm
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from peft import PeftModel
 from qwen_vl_utils import process_vision_info
 
-# --- CONFIGURATION ---
-BASE_MODEL_PATH = "Qwen/Qwen2.5-VL-7B-Instruct"
+# --- 1. CONFIGURATION ---
+# Base model path (the same local folder you used for training)
+BASE_MODEL_PATH = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-# --- 1. COORDINATE PARSING ---
-def extract_boxes_from_text(text, img_w, img_h):
-    """
-    Parses Qwen's <box>(y1,x1),(y2,x2)</box> format.
-    Returns a list of [x1, y1, x2, y2] in absolute pixels.
-    """
-    pattern = r"\((\d+),(\d+)\),\((\d+),(\d+)\)"
-    matches = re.findall(pattern, text)
-    
-    boxes = []
-    for m in matches:
-        # Qwen uses (y, x) ordering on 0-1000 scale
-        y1, x1, y2, x2 = map(int, m)
-        
-        # Convert to Pixels [x, y, x, y]
-        px1 = (x1 / 1000.0) * img_w
-        py1 = (y1 / 1000.0) * img_h
-        px2 = (x2 / 1000.0) * img_w
-        py2 = (y2 / 1000.0) * img_h
-        
-        boxes.append([
-            min(px1, px2), min(py1, py2), 
-            max(px1, px2), max(py1, py2)
-        ])
-    return boxes
+# The directory where SFTTrainer saved your fine-tuned adapter
+ADAPTER_PATH = "./qwen2.5-vl-signature-detector" 
 
-def calculate_iou(boxA, boxB):
-    """Calculates Intersection over Union between two boxes."""
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
+# The image you want to test
+TEST_IMAGE_PATH = "./data/images/test_oib30f00-first-var_jpg.rf.8230feb7ec08f9ffe2de7a813f7fcaff_orig.jpg"
 
-    interArea = max(0, xB - xA) * max(0, yB - yA)
-    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+# --- 2. LOAD MODEL & ADAPTER ---
+print("⏳ Loading Base Model...")
+base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    BASE_MODEL_PATH,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    local_files_only=True
+)
 
-    return interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+print(f"⏳ Merging LoRA Adapter from {ADAPTER_PATH}...")
+# This applies your specific signature-detection knowledge onto the base model
+model = PeftModel.from_pretrained(base_model, ADAPTER_PATH)
+model.eval() # Set to evaluation mode
 
-# --- 2. VISUALIZATION ---
-def save_comparison_plot(results, filename, title):
-    if not results: return
-    
-    n = min(5, len(results))
-    fig, axes = plt.subplots(1, n, figsize=(n * 5, 5))
-    if n == 1: axes = [axes]
-    
-    for i in range(n):
-        ax = axes[i] if n > 1 else axes[0]
-        item = results[i]
-        
-        ax.imshow(item['image'])
-        
-        # Draw GT (Green)
-        for box in item['gt_boxes']:
-            w, h = box[2] - box[0], box[3] - box[1]
-            rect = patches.Rectangle((box[0], box[1]), w, h, 
-                                   linewidth=2, edgecolor='#00FF00', facecolor='none', label='GT')
-            ax.add_patch(rect)
-            
-        # Draw Pred (Red)
-        for box in item['pred_boxes']:
-            w, h = box[2] - box[0], box[3] - box[1]
-            rect = patches.Rectangle((box[0], box[1]), w, h, 
-                                   linewidth=2, edgecolor='red', linestyle='--', facecolor='none', label='Pred')
-            ax.add_patch(rect)
-            
-        ax.set_title(f"IoU: {item['iou']:.2f}", fontsize=12)
-        ax.axis('off')
-    
-    # Legend on last plot
-    if n > 1: axes[-1].legend(loc='lower right')
-    else: axes[0].legend(loc='lower right')
-    
-    plt.suptitle(title, fontsize=16)
-    plt.tight_layout()
-    plt.savefig(filename)
-    plt.close()
-    print(f"Saved visualization to {filename}")
+print("⏳ Loading Processor...")
+processor = AutoProcessor.from_pretrained(ADAPTER_PATH, local_files_only=True)
 
-# --- 3. MAIN EVALUATION LOOP ---
-def evaluate(args):
-    print(f">> Loading Base Model: {BASE_MODEL_PATH}")
-    
-    # 1. Load Processor
-    processor = AutoProcessor.from_pretrained(BASE_MODEL_PATH, min_pixels=256*28*28, max_pixels=1280*28*28)
+# --- 3. PREPARE THE INPUT ---
+# We use the exact same prompt structure from your training data
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "image", "image": TEST_IMAGE_PATH},
+            {"type": "text", "text": "Locate the signature."}
+        ]
+    }
+]
 
-    # 2. Load Model
-    print(">> Loading Model (using 'sdpa' attention)...")
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        BASE_MODEL_PATH,
-        dtype=torch.bfloat16,       # FIXED: Changed from torch_dtype to dtype
-        attn_implementation="sdpa", # FIXED: "sdpa" is native torch attention (stable & fast)
-        device_map="auto",
+print("🧠 Processing input...")
+# Format the text prompt using the chat template
+text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+image_inputs, video_inputs = process_vision_info(messages)
+
+# Tokenize
+inputs = processor(
+    text=[text_prompt],
+    images=image_inputs,
+    videos=video_inputs,
+    padding=True,
+    return_tensors="pt"
+).to(model.device)
+
+# --- 4. GENERATE PREDICTION ---
+print("🚀 Generating prediction...")
+with torch.inference_mode():
+    generated_ids = model.generate(
+        **inputs,
+        max_new_tokens=100, # We only need a few tokens for the bounding box
+        do_sample=False     # Greedy decoding is best for precise coordinates
     )
-    
-    # Load Adapters
-    if args.checkpoint:
-        print(f">> Loading Adapters from: {args.checkpoint}")
-        model = PeftModel.from_pretrained(model, args.checkpoint)
-    
-    model.eval()
 
-    # 3. Load Data
-    print(f">> Reading JSONL: {args.test_jsonl}")
-    if not os.path.exists(args.test_jsonl):
-        print(f"Error: File not found at {args.test_jsonl}")
+# Slice off the input prompt tokens to isolate just the model's answer
+generated_ids_trimmed = [
+    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+]
+
+output_text = processor.batch_decode(
+    generated_ids_trimmed, skip_special_tokens=False, clean_up_tokenization_spaces=False
+)[0]
+
+print(f"\n📝 Raw Model Output:\n{output_text}\n")
+output_text="<|box_start|>(520,264),(683,328)<|box_end|> signature"
+# --- 5. PARSE AND VISUALIZE THE OUTPUT ---
+def visualize_prediction(image_path, model_output):
+    # Read the original image to get its pixel dimensions
+    image = cv2.imread(image_path)
+    if image is None:
+        print("Error loading image for visualization.")
         return
-
-    with open(args.test_jsonl, 'r') as f:
-        data = [json.loads(line) for line in f if line.strip()]
-
-    if args.limit > 0:
-        data = data[:args.limit]
-        print(f"   [!] Limiting to first {args.limit} images.")
-
-    results = []
-
-    print(">> Starting Inference...")
-    for item in tqdm(data):
-        img_path = os.path.join(args.base_data_path, item['image'])
         
-        try:
-            image = Image.open(img_path).convert("RGB")
-            w, h = image.size
-        except:
-            print(f"Missing image: {img_path}")
-            continue
-
-        # A. Get Ground Truth
-        gt_text = item['conversations'][1]['value']
-        gt_boxes = extract_boxes_from_text(gt_text, w, h)
-
-        # B. Get Prediction
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": "Locate the signature."},
-                ],
-            }
-        ]
-        
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs = process_vision_info(messages)
-        
-        inputs = processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        ).to("cuda")
-
-        with torch.no_grad():
-            generated_ids = model.generate(**inputs, max_new_tokens=128)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    h, w, _ = image.shape
+    
+    # Use Regex to find the normalized coordinates in the model's text output
+    # Looking for: <|box_start|>(y1,x1),(y2,x2)<|box_end|>
+    pattern = r"<\|box_start\|>\((\d+),(\d+)\),\((\d+),(\d+)\)<\|box_end\|>"
+    matches = re.findall(pattern, model_output)
+    
+    if not matches:
+        print("⚠️ No valid bounding boxes found in the output format.")
+    else:
+        for match in matches:
+            y1_n, x1_n, y2_n, x2_n = map(int, match)
             
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        pred_text = processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )[0]
-        
-        pred_boxes = extract_boxes_from_text(pred_text, w, h)
+            # Convert 0-1000 normalized coordinates back to actual image pixels
+            x1 = int((x1_n / 1000) * w)
+            y1 = int((y1_n / 1000) * h)
+            x2 = int((x2_n / 1000) * w)
+            y2 = int((y2_n / 1000) * h)
+            x1, y1, x2, y2 = x1_n, y1_n, x2_n, y2_n
+            
+            # Draw the bounding box (Green, thickness 3)
+            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 3)
+            
+            # Add the label
+            cv2.putText(
+                image, "Signature", (x1, max(y1 - 10, 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2
+            )
+            print(f"🎯 Found signature at pixel coordinates: [{x1}, {y1}, {x2}, {y2}]")
 
-        # C. Calculate Metrics
-        best_iou = 0.0
-        if pred_boxes and gt_boxes:
-            best_iou = calculate_iou(pred_boxes[0], gt_boxes[0])
-        elif not pred_boxes and not gt_boxes:
-            best_iou = 1.0 
+    # Display the result
+    plt.figure(figsize=(10, 10))
+    plt.imshow(image)
+    plt.axis("off")
+    plt.show()
+    # If you are on a headless server without a GUI, use this instead of plt.show():
+    cv2.imwrite("output_prediction.jpg", cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
 
-        results.append({
-            "id": item['id'],
-            "image": image,
-            "gt_boxes": gt_boxes,
-            "pred_boxes": pred_boxes,
-            "iou": best_iou
-        })
-
-    # 4. Summary
-    if not results:
-        print("No results generated.")
-        return
-
-    ious = [r['iou'] for r in results]
-    mean_iou = sum(ious) / len(ious)
-    
-    print("\n" + "="*30)
-    print(f" EVALUATION RESULTS")
-    print(f" Mean IoU: {mean_iou:.4f}")
-    print("="*30)
-    
-    results.sort(key=lambda x: x['iou'], reverse=True)
-    
-    save_comparison_plot(results[:5], "comparison_best.png", "Best Predictions")
-    save_comparison_plot(results[-5:], "comparison_worst.png", "Worst Predictions")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default="output_model/qwen_grounding_specialist/best_model")
-    parser.add_argument("--base_data_path", type=str, default="data/qwen_signatures_ready")
-    parser.add_argument("--test_jsonl", type=str, default="data/qwen_signatures_ready/test.jsonl")
-    parser.add_argument("--limit", type=int, default=20)
-    
-    args = parser.parse_args()
-    evaluate(args)
+visualize_prediction(TEST_IMAGE_PATH, output_text)

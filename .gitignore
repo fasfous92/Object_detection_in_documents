@@ -207,7 +207,7 @@ marimo/_lsp/
 __marimo__/
 
 output_model/
-output/*
+output/
 qwen2.5-vl-signature-detector/
 pdf_to_image/
 data_signature_only/
@@ -216,3 +216,4 @@ qwen2.5-vl-signature-stamp-detector
 
 data/
 data_final/
+output/qwen2.5-vl-final-detector

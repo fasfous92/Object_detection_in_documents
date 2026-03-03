@@ -15,11 +15,11 @@ from wrapper.Qwen_25_LLM import Qwen_llm
 
 # --- 1. CONFIGURATION ---
 LOCAL_MODEL_PATH = "Qwen/Qwen2.5-VL-3B-Instruct" 
-OUTPUT_DIR = "./qwen2.5-vl-final-detector"
+OUTPUT_DIR = "output/qwen2.5-vl-final-detector"
 TRAIN_DATA = "data_final/train.jsonl"
 VALID_DATA = "data_final/valid.jsonl"
 
-RESUME_ADAPTER_PATH =None #"./qwen2.5-vl-signature-detector" # Leave empty string "" if starting from scratch
+RESUME_ADAPTER_PATH ="output/qwen2.5-vl-final-detector" # Leave empty string "" if starting from scratch
 
 # --- 2. LOAD MODEL VIA WRAPPER ---
 # Initialize the wrapper
@@ -43,16 +43,17 @@ if not (RESUME_ADAPTER_PATH and os.path.exists(RESUME_ADAPTER_PATH)):
         r=16,
         lora_alpha=32,
         target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj", #self-attention layers for both text and vision
-            "gate_proj", "up_proj", "down_proj", #visual cross attention layers
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
             
-            "visual.merger.mlp.0", "visual.merger.mlp.2" #visual layers to improve ibject detection
+            "visual.merger.mlp.0", "visual.merger.mlp.2"
         ],
         task_type="CAUSAL_LM",
         lora_dropout=0.05,
         bias="none"
     )
     
+    # YOUR FIX: Reassign the wrapped PEFT model directly back to the wrapper's property
     qwen_wrapper.model = get_peft_model(qwen_wrapper.model, lora_config)
     qwen_wrapper.model.print_trainable_parameters()
 else:
@@ -156,20 +157,22 @@ training_args = TrainingArguments(
     logging_steps=10, 
     dataloader_num_workers=4, 
     dataloader_prefetch_factor=2, 
-    gradient_checkpointing=False, # 🚀 ADD THIS: Drastically reduces VRAM
+    gradient_checkpointing=True, # 🚀 ADD THIS: Drastically reduces VRAM
     gradient_checkpointing_kwargs={"use_reentrant": False},
     
     # --- BEST MODEL SELECTION LOGIC ---
     eval_strategy="epoch",          # Evaluate at the end of each epoch
     save_strategy="epoch",          # Save a checkpoint at the end of each epoch (Must match eval_strategy)
     save_total_limit=3,             # Keep the last 3 checkpoints to save disk space
-    load_best_model_at_end=True,    
-    metric_for_best_model="eval_loss", 
-    greater_is_better=False,        
+    load_best_model_at_end=True,    # 🚀 Load the best model at the end of training
+    metric_for_best_model="eval_loss", # 🚀 Use validation loss to judge "best"
+    greater_is_better=False,        # 🚀 Lower validation loss is better
+    
     remove_unused_columns=False, 
     report_to="none" 
 )
 # --- 6. SFT TRAINER ---
+
 print("🚀 Initializing SFTTrainer with Early Stopping...")
 trainer = SFTTrainer(
     model=qwen_wrapper.model,
@@ -177,17 +180,17 @@ trainer = SFTTrainer(
     train_dataset=train_dataset,
     eval_dataset=valid_dataset,
     data_collator=qwen_collate_fn,
+    dataset_kwargs={"skip_prepare_dataset": True}, # 🚀 ADD THIS LINE
+    max_seq_length=4096, # 🚀 ADD THIS ON YOUR NEXT RUN
     callbacks=[EarlyStoppingCallback(early_stopping_patience=2)] 
 )
-
 # --- 7. TRAIN & SAVE ---
 print("🔥 Starting Training...")
 
-if RESUME_ADAPTER_PATH and os.path.exists(RESUME_ADAPTER_PATH):
-    print(f"⏸️ Resuming training from checkpoint: {RESUME_ADAPTER_PATH}")
-    trainer.train(resume_from_checkpoint=True)
-else:
-    trainer.train()
+# 🚀 PRO TIP: If you want to resume exactly from a crashed epoch (keeping optimizer states),
+# change trainer.train() to trainer.train(resume_from_checkpoint=True)
+# assuming your OUTPUT_DIR contains standard Hugging Face checkpoint folders.
+trainer.train()
 
 print(f"💾 Saving LoRA adapter to {OUTPUT_DIR}...")
 trainer.save_model(OUTPUT_DIR)

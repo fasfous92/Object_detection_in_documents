@@ -136,44 +136,33 @@ class Qwen_llm:
         return  output_text,original_width, original_height
     
 
-    def postprocess(self, raw_output, original_width, original_height, is_ground_truth=False, normalize=True):
+    def postprocess_prediction(self, raw_output, original_width, original_height, normalize=True):
         """
-        Extracts JSON structured bounding boxes, conditionally un-normalizes coordinates, 
-        and formats them for the SignatureBenchmark class.
-        
-        Args:
-            raw_output (str): The raw text output or clean GT JSON.
-            original_width (int): The width of the original document.
-            original_height (int): The height of the original document.
-            is_ground_truth (bool): If True, bypasses LLM-specific text cleaning.
-            normalize (bool): If True, un-normalizes from 0-1000 scale to absolute pixels. 
-                            If False, treats inputs as absolute pixels.
+        Cleans LLM artifacts from the prediction output, extracts JSON bounding boxes, 
+        conditionally un-normalizes coordinates, and formats them.
         """
         clean_output = raw_output.strip()
         
-        if not is_ground_truth:
-            # Strip specific stop tokens
-            clean_output = clean_output.replace("<|im_end|>", "").strip()
-            clean_output = clean_output.replace("<|endoftext|>", "").strip()
+        # Strip specific Qwen stop tokens
+        clean_output = clean_output.replace("<|im_end|>", "").strip()
+        clean_output = clean_output.replace("<|endoftext|>", "").strip()
+        
+        # Handle the case where the model hallucinates markdown JSON wrappers
+        if clean_output.startswith("```json"):
+            clean_output = clean_output[7:]
+        if clean_output.endswith("```"):
+            clean_output = clean_output[:-3]
             
-            # Handle markdown JSON wrappers
-            if clean_output.startswith("```json"):
-                clean_output = clean_output[7:]
-            if clean_output.endswith("```"):
-                clean_output = clean_output[:-3]
-                
-            clean_output = clean_output.strip()
+        clean_output = clean_output.strip()
         
         try:
             detections = json.loads(clean_output)
         except json.JSONDecodeError as e:
-            prefix = "Ground Truth" if is_ground_truth else "Prediction"
-            print(f"⚠️ Warning: Failed to parse {prefix} JSON. Error: {e}")
+            print(f"⚠️ Warning: Failed to parse Prediction JSON. Error: {e}")
             print(f"Raw output was: {raw_output}")
             return []
             
         pixel_results = []
-        
         if not isinstance(detections, list) or len(detections) == 0:
             return pixel_results
             
@@ -184,45 +173,84 @@ class Qwen_llm:
             if len(bbox) != 4:
                 continue
                 
-            # Unpack directly as [xmin, ymin, xmax, ymax]
             x1_n, y1_n, x2_n, y2_n = bbox
             
-            # ---------------------------------------------------------
-            # THE FIX: Conditional Normalization
-            # ---------------------------------------------------------
             if normalize:
-                # Un-normalize back to original dimensions (Assuming 0-1000 scale)
                 x1 = int((x1_n / 1000.0) * original_width)
                 y1 = int((y1_n / 1000.0) * original_height)
                 x2 = int((x2_n / 1000.0) * original_width)
                 y2 = int((y2_n / 1000.0) * original_height)
             else:
-                # Treat values directly as absolute pixels
                 x1, y1, x2, y2 = int(x1_n), int(y1_n), int(x2_n), int(y2_n)
             
-            # Safety Check: Clip to image boundaries (applies to both modes)
             x1 = max(0, min(original_width - 1, x1))
             y1 = max(0, min(original_height - 1, y1))
             x2 = max(0, min(original_width - 1, x2))
             y2 = max(0, min(original_height - 1, y2))
             
-            # Ensure correct ordering (prevents inverted boxes mathematically)
             x1, x2 = min(x1, x2), max(x1, x2)
             y1, y2 = min(y1, y2), max(y1, y2)
             
-            # Only append valid, non-zero area boxes
             if (x2 - x1) > 0 and (y2 - y1) > 0:
-                pixel_results.append({
-                    "bbox": [x1, y1, x2, y2], 
-                    "label": label
-                })
+                pixel_results.append({"bbox": [x1, y1, x2, y2], "label": label})
                 
         return pixel_results
- 
-    def plot_bounding_boxes(self,image_path, predictions=None, ground_truths=None, save_path=None):
+    def postprocess_ground_truth(self, raw_output, original_width, original_height, normalize=True):
+        """
+        Parses clean ground truth JSON, conditionally un-normalizes coordinates, 
+        and formats them. Bypasses all LLM-specific text cleaning.
+        """
+        # Robustness check: If the dataset already parsed the JSON into a Python list, use it directly.
+        if isinstance(raw_output, list):
+            detections = raw_output
+        else:
+            # Otherwise, assume it's a JSON string and parse it.
+            clean_output = raw_output.strip()
+            try:
+                detections = json.loads(clean_output)
+            except json.JSONDecodeError as e:
+                print(f"⚠️ Warning: Failed to parse Ground Truth JSON. Error: {e}")
+                print(f"Raw GT was: {raw_output}")
+                return []
+                
+        pixel_results = []
+        if not isinstance(detections, list) or len(detections) == 0:
+            return pixel_results
+            
+        for det in detections:
+            bbox = det.get("bbox_2d", det.get("bbox", []))
+            label = det.get("label", "unknown")
+            
+            if len(bbox) != 4:
+                continue
+                
+            x1_n, y1_n, x2_n, y2_n = bbox
+            
+            if normalize:
+                x1 = int((x1_n / 1000.0) * original_width)
+                y1 = int((y1_n / 1000.0) * original_height)
+                x2 = int((x2_n / 1000.0) * original_width)
+                y2 = int((y2_n / 1000.0) * original_height)
+            else:
+                x1, y1, x2, y2 = int(x1_n), int(y1_n), int(x2_n), int(y2_n)
+            
+            x1 = max(0, min(original_width - 1, x1))
+            y1 = max(0, min(original_height - 1, y1))
+            x2 = max(0, min(original_width - 1, x2))
+            y2 = max(0, min(original_height - 1, y2))
+            
+            x1, x2 = min(x1, x2), max(x1, x2)
+            y1, y2 = min(y1, y2), max(y1, y2)
+            
+            if (x2 - x1) > 0 and (y2 - y1) > 0:
+                pixel_results.append({"bbox": [x1, y1, x2, y2], "label": label})
+                
+        return pixel_results
+
+    def plot_bounding_boxes(self, image_path, predictions=None, ground_truths=None, save_path=None):
         """
         Visualizes the image, drawing predictions in Green and ground truths in Red.
-        Includes robust error handling for missing or malformed bounding boxes.
+        Assumes bounding boxes are already in absolute pixel coordinates [xmin, ymin, xmax, ymax].
         """
         image = cv2.imread(image_path)
         if image is None:
@@ -236,45 +264,46 @@ class Qwen_llm:
         ground_truths = ground_truths or []
         predictions = predictions or []
 
-        # Plot Ground Truths (RED)
+        # Helper to safely extract coordinates and labels from various dictionary formats
+        def extract_bbox_and_label(item, default_prefix):
+            if isinstance(item, dict):
+                # Check for 'bbox' first, fallback to 'bbox_2d'
+                bbox = item.get("bbox", item.get("bbox_2d", []))
+                label = f"{default_prefix}: {item.get('label', 'unknown')}"
+                return bbox, label
+            return item, default_prefix # Fallback for flat lists
+
+        # --- 1. Plot Ground Truths (RED) ---
         for gt in ground_truths:
-            if isinstance(gt, dict):
-                bbox = gt.get("bbox", [])
-                label_text = f"GT: {gt.get('label', 'unknown')}"
-            else:
-                bbox = gt  # Fallback for old list format
-                label_text = "GT"
+            bbox, label_text = extract_bbox_and_label(gt, "GT")
                 
-            # 🚀 THE FIX: Ensure we actually have 4 coordinates before unpacking
             if len(bbox) != 4:
                 print(f"⚠️ Skipping malformed GT bbox: {bbox}")
                 continue
                 
             x1, y1, x2, y2 = map(int, bbox)
             cv2.rectangle(image, (x1, y1), (x2, y2), (255, 0, 0), 3) # Red box
-            cv2.putText(image, label_text, (x1, max(y1 - 10, 10)), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+            
+            # Place GT text ABOVE the box
+            cv2.putText(image, label_text, (x1, max(y1 - 8, 10)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-        # Plot Predictions (GREEN)
+        # --- 2. Plot Predictions (GREEN) ---
         for pred in predictions:
-            if isinstance(pred, dict):
-                bbox = pred.get("bbox", [])
-                label_text = f"Pred: {pred.get('label', 'unknown')}"
-            else:
-                bbox = pred  # Fallback for old list format
-                label_text = "Pred"
+            bbox, label_text = extract_bbox_and_label(pred, "Pred")
                 
-            # 🚀 THE FIX: Ensure we actually have 4 coordinates before unpacking
             if len(bbox) != 4:
                 print(f"⚠️ Skipping malformed Pred bbox: {bbox}")
                 continue
                 
             x1, y1, x2, y2 = map(int, bbox)
             cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 3) # Green box
-            cv2.putText(image, label_text, (x1, max(y1 - 10, 10)), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            
+            # Place Prediction text BELOW the box to prevent overlap with GT text
+            cv2.putText(image, label_text, (x1, min(y2 + 20, image.shape[0] - 10)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        # Save or Display
+        # --- 3. Save or Display ---
         if save_path:
             # Convert back to BGR because OpenCV expects BGR for saving
             image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
@@ -285,203 +314,85 @@ class Qwen_llm:
             plt.imshow(image)
             plt.axis("off")    
             plt.show()
+            
+######New approach ##################
+
+    def parse_qwen_ground_truth(self,gt_string: str, img_width: int = None, img_height: int = None):
+        """
+        Parses Qwen-VL's native bounding box format (with special tokens) 
+        into a structured list of dictionaries.
+        """
+        # Regex breakdown:
+        # <\|object_ref_start\|>(.*?)<\|object_ref_end\|> -> Captures the label text non-greedily
+        # <\|box_start\|>\((\d+),(\d+)\),\((\d+),(\d+)\)<\|box_end\|> -> Captures the (xmin, ymin), (xmax, ymax) numbers
+        # Note: We use \| to escape the pipe character, as it is a special regex operator.
+        pattern = r"<\|object_ref_start\|>(.*?)<\|object_ref_end\|><\|box_start\|>\((\d+),(\d+)\),\((\d+),(\d+)\)<\|box_end\|>"
+        
+        matches = re.findall(pattern, gt_string)
+        results = []
+        
+        for match in matches:
+            label = match[0]
+            
+            # Extract the normalized [0-1000] coordinates
+            norm_xmin = int(match[1])
+            norm_ymin = int(match[2])
+            norm_xmax = int(match[3])
+            norm_ymax = int(match[4])
+            
+            # If image dimensions are provided, scale back to actual image pixels
+            if img_width and img_height:
+                xmin = int((norm_xmin / 1000.0) * img_width)
+                ymin = int((norm_ymin / 1000.0) * img_height)
+                xmax = int((norm_xmax / 1000.0) * img_width)
+                ymax = int((norm_ymax / 1000.0) * img_height)
+            else:
+                # Otherwise, return the raw 0-1000 scale
+                xmin, ymin, xmax, ymax = norm_xmin, norm_ymin, norm_xmax, norm_ymax
+                
+            results.append({
+                "label": label,
+                "bbox": [xmin, ymin, xmax, ymax]
+            })
+            
+        return results
 
     
-    def evaluate(self,dataset) -> Dict:
+    def parse_qwen_detections(self, model_output: str, img_width: int = None, img_height: int = None):
         """
-        Computes IoU scores between predicted and ground truth boxes.
-        Returns a list of IoU scores for each prediction.
+        Parses the continuous string output from Qwen-VL into a structured list of dictionaries.
+        Optionally converts normalized [0-1000] coordinates back to absolute image pixels.
         """
-            
-        def calculate_iou(boxA, boxB):
-            # Standard IoU calculation
-            xA = max(boxA[0], boxB[0])
-            yA = max(boxA[1], boxB[1])
-            xB = min(boxA[2], boxB[2])
-            yB = min(boxA[3], boxB[3])
-
-            interArea = max(0, xB - xA) * max(0, yB - yA)
-            boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-            boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-
-            return interArea / float(boxAArea + boxBArea - interArea + 1e-6)
-             
+        # Regex breakdown: 
+        # ([a-zA-Z]+)  -> Captures the label (e.g., 'stamp', 'signature')
+        # \((\d+),(\d+)\),\((\d+),(\d+)\) -> Captures the (xmin, ymin), (xmax, ymax) numbers
+        pattern = r"([a-zA-Z]+)\((\d+),(\d+)\),\((\d+),(\d+)\)"
         
-        def evaluate_detection(pred_box, gt_box, img_width=1, img_height=1):
-            """
-            Evaluates prediction against ground truth with distance metrics.
+        matches = re.findall(pattern, model_output)
+        results = []
+        
+        for match in matches:
+            label = match[0]
             
-            Args:
-                pred_box (list): [xmin, ymin, xmax, ymax]
-                gt_box (list):   [xmin, ymin, xmax, ymax]
-                img_width (int): Width of the image (for normalization)
-                img_height (int): Height of the image (for normalization)
+            # Extract the normalized [0-1000] coordinates
+            norm_xmin = int(match[1])
+            norm_ymin = int(match[2])
+            norm_xmax = int(match[3])
+            norm_ymax = int(match[4])
+            
+            # If image dimensions are provided, scale back to actual image pixels
+            if img_width and img_height:
+                xmin = int((norm_xmin / 1000.0) * img_width)
+                ymin = int((norm_ymin / 1000.0) * img_height)
+                xmax = int((norm_xmax / 1000.0) * img_width)
+                ymax = int((norm_ymax / 1000.0) * img_height)
+            else:
+                # Otherwise, just return the raw 0-1000 scale
+                xmin, ymin, xmax, ymax = norm_xmin, norm_ymin, norm_xmax, norm_ymax
                 
-            Returns:
-                dict: IoU, IoP, Center Distance (Pixels), Normalized Center Distance (0-1)
-            """
-            # --- 1. IoU Calculation (Standard) ---
-            xA = max(pred_box[0], gt_box[0])
-            yA = max(pred_box[1], gt_box[1])
-            xB = min(pred_box[2], gt_box[2])
-            yB = min(pred_box[3], gt_box[3])
+            results.append({
+                "label": label,
+                "bbox": [xmin, ymin, xmax, ymax]
+            })
             
-            interArea = max(0, xB - xA) * max(0, yB - yA)
-            predArea = (pred_box[2] - pred_box[0]) * (pred_box[3] - pred_box[1])
-            gtArea = (gt_box[2] - gt_box[0]) * (gt_box[3] - gt_box[1])
-            
-            iou = interArea / float(predArea + gtArea - interArea + 1e-6)
-            iop = interArea / float(predArea + 1e-6) # Intersection over Prediction
-
-            # --- 2. Center Point Calculation ---
-            pred_cx = (pred_box[0] + pred_box[2]) / 2.0
-            pred_cy = (pred_box[1] + pred_box[3]) / 2.0
-            
-            gt_cx = (gt_box[0] + gt_box[2]) / 2.0
-            gt_cy = (gt_box[1] + gt_box[3]) / 2.0
-            
-            # --- 3. Euclidean Distance (Pixels) ---
-            # Pythagorean theorem: a^2 + b^2 = c^2
-            dist_pixels = math.sqrt((pred_cx - gt_cx)**2 + (pred_cy - gt_cy)**2)
-            
-            # --- 4. Normalized Distance (0.0 to 1.0) ---
-            # Distance relative to the image diagonal. 
-            # 0.05 means the center is off by 5% of the image size.
-            # This helps compare errors across images of different resolutions.
-            img_diagonal = math.sqrt(img_width**2 + img_height**2) + 1e-6
-            norm_dist = dist_pixels / img_diagonal
-
-            return {
-                "iou": round(iou, 4),
-                "iop": round(iop, 4),
-                "center_dist_px": round(dist_pixels, 1),
-                "norm_center_dist": round(norm_dist, 4)
-            }
-   
-        
-        def match_predictions_to_ground_truth(pred_boxes, gt_boxes, iou_threshold=0.5):
-            """
-            Matches predictions to ground truths using greedy IoU strategy.
-            
-            Args:
-                pred_boxes (list): List of [xmin, ymin, xmax, ymax]
-                gt_boxes (list):   List of [xmin, ymin, xmax, ymax]
-                iou_threshold (float): Minimum IoU to consider a match valid
-                
-            Returns:
-                matches (list): List of dicts {'pred': box, 'gt': box, 'iou': float}
-                unmatched_preds (list): List of pred_boxes that matched nothing
-                unmatched_gts (list): List of gt_boxes that were missed
-            """
-            matches = []
-            # pred_boxes = [box['bbox_2d'] for box in pred_boxes]
-            
-            # Keep track of which indices have been matched
-            matched_pred_indices = set()
-            matched_gt_indices = set()
-            
-            # 1. Calculate IoU for ALL pairs
-            # Format: (iou, pred_index, gt_index)
-            all_pairs = []
-            for i, p_box in enumerate(pred_boxes):
-                for j, g_box in enumerate(gt_boxes):
-                    iou = calculate_iou(p_box, g_box)
-                    if iou > 0.0: # Only consider pairs that overlap at least a little
-                        all_pairs.append((iou, i, j))
-            
-            # 2. Sort pairs by IoU (Highest first)
-            all_pairs.sort(key=lambda x: x[0], reverse=True)
-            
-            # 3. Greedy Matching
-            for iou, p_idx, g_idx in all_pairs:
-                if p_idx not in matched_pred_indices and g_idx not in matched_gt_indices:
-                    # Found the best remaining match!
-                    if iou >= iou_threshold:
-                        matches.append({
-                            'pred': pred_boxes[p_idx],
-                            'gt': gt_boxes[g_idx],
-                            'iou': iou
-                        })
-                        matched_pred_indices.add(p_idx)
-                        matched_gt_indices.add(g_idx)
-            
-            # 4. Gather leftovers
-            unmatched_preds = [p for i, p in enumerate(pred_boxes) if i not in matched_pred_indices]
-            unmatched_gts = [g for i, g in enumerate(gt_boxes) if i not in matched_gt_indices]
-            
-            return matches, unmatched_preds, unmatched_gts
-
-        
-        metrics_summary = {
-            "iou": [],
-            "iop": [],
-            "norm_dist": [],
-            "false_positives": 0,
-            "missed_signatures": 0,
-            "total_images": 0
-        }
-        conficting_predictions = []
-
-        for item in tqdm(dataset):
-            image_path = item['image_path']
-            ground_truth = item['groundTruth']
-            
-            metrics_summary["total_images"] += 1
-
-            
-            output_text = self.predict(image_path, "Locate the signature")
-            output_text = self.postprocess(output_text, image_width=640, image_height=640)
-            ground_truth = self.postprocess(ground_truth, image_width=640, image_height=640)
-            
-            matches, false_positives, misses = match_predictions_to_ground_truth(output_text, ground_truth, iou_threshold=0.1)
-            metrics_summary["false_positives"] += len(false_positives)
-            metrics_summary["missed_signatures"] += len(misses)
-            if len(false_positives) > 0 or len(misses) > 0: #append only if there is a conflict to analyze
-                conficting_predictions.append({
-                    "image_path": image_path,
-                    "predictions": output_text,
-                    "ground_truths": ground_truth,
-                    "false_positives": false_positives,
-                    "misses": misses
-                })
-
-            
-            # Collect Metrics for Matches
-            for match in matches:
-                # Evaluate using the normalized distance metric
-                m = evaluate_detection(match['pred'], match['gt'], img_width=640, img_height=640)
-                
-                metrics_summary["iou"].append(m['iou'])
-                metrics_summary["iop"].append(m['iop'])
-                metrics_summary["norm_dist"].append(m['norm_center_dist'])
-            
-        # --- 3. Calculate Averages ---
-        total_matches = len(metrics_summary["iou"])
-
-        if total_matches > 0:
-            avg_iou = sum(metrics_summary["iou"]) / total_matches
-            avg_iop = sum(metrics_summary["iop"]) / total_matches
-            avg_norm_dist = sum(metrics_summary["norm_dist"]) / total_matches
-        else:
-            avg_iou = avg_iop = avg_norm_dist = 0.0
-
-        # --- 4. Final Report ---
-        print("\n" + "="*50)
-        print(f" FINAL EVALUATION REPORT ({metrics_summary['total_images']} Images)")
-        print("="*50)
-        print(f"Total Matches Found:      {total_matches}")
-        print(f"Total Missed Signatures:  {metrics_summary['missed_signatures']}")
-        print(f"Total False Positives:    {metrics_summary['false_positives']}")
-        print("-" * 50)
-        print(f"Mean IoU (Overlap):             {avg_iou:.4f}")
-        print(f"Mean IoP (Tightness/Precision): {avg_iop:.4f}")
-        print(f"Mean Normalized Center Error:   {avg_norm_dist:.4f} ({(avg_norm_dist*100):.2f}% of image diagonal)")
-        print("="*50)
-        
-        #save the conflicting predictions for error analysis
-        with open("conflicting_predictions.json", "w") as f:
-            json.dump(conficting_predictions, f, indent=4)
-            print(f"📁 Saved conflicting predictions to conflicting_predictions.json for error analysis.")
-        
-        return metrics_summary
-        
+        return results
