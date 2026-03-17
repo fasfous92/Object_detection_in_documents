@@ -17,6 +17,7 @@ PROJ1_WORKSPACE = "personal-cquvu"
 PROJ1_NAME = "authentications_elements_from_documents"
 PROJ1_VERSION = 1
 
+
 # Final Output Settings
 OUTPUT_DIR = "data_final"
 FINAL_IMG_DIR = os.path.join(OUTPUT_DIR, "images")
@@ -107,7 +108,7 @@ def process_set(samples, split_name):
         random.shuffle(targets)
         
         # Keep the prompt natural and remove the instruction to output JSON
-        prompt_text = f"Detect all {targets[0]}, {targets[1]}, and {targets[2]}."
+        prompt_text = f"Detect all {targets[0]}, {targets[1]}, and {targets[2]}. If none are found, respond with: None of the requested objects were found."
                     
         entries.append({
             "messages": [

@@ -216,4 +216,9 @@ qwen2.5-vl-signature-stamp-detector
 
 data/
 data_final/
+data_final_stamps/
+data_final_signature/
+
+
 output/qwen2.5-vl-final-detector
+data_grounding_dino/
