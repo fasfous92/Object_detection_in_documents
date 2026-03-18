@@ -376,41 +376,67 @@ class Qwen_llm:
         return results
 
     
-    def parse_qwen_detections(self, model_output: str, img_width: int = None, img_height: int = None):
+    def parse_qwen_detections(self, model_output: str, original_width: int = None, original_height: int = None,normalize=True):
         """
-        Parses the continuous string output from Qwen-VL into a structured list of dictionaries.
-        Optionally converts normalized [0-1000] coordinates back to absolute image pixels.
+        Cleans LLM artifacts from the prediction output, extracts native Qwen bounding boxes 
+        using regex, conditionally un-normalizes coordinates, and formats them.
         """
-        # Regex breakdown: 
-        # ([a-zA-Z]+)  -> Captures the label (e.g., 'stamp', 'signature')
-        # \((\d+),(\d+)\),\((\d+),(\d+)\) -> Captures the (xmin, ymin), (xmax, ymax) numbers
-        pattern = r"([a-zA-Z]+)\((\d+),(\d+)\),\((\d+),(\d+)\)"
+        clean_output = model_output.strip()
         
-        matches = re.findall(pattern, model_output)
+        # Strip specific Qwen stop tokens
+        clean_output = clean_output.replace("<|im_end|>", "").strip()
+        clean_output = clean_output.replace("<|endoftext|>", "").strip()
+        
+        # Handle the case where the model hallucinates markdown wrappers
+        if clean_output.startswith("```"):
+            clean_output = re.sub(r"^```.*?\n", "", clean_output)
+        if clean_output.endswith("```"):
+            clean_output = clean_output[:-3]
+            
+        clean_output = clean_output.strip()
+        
         results = []
         
+        # Regex for Qwen's native format: <box>(ymin,xmin),(ymax,xmax)</box>
+        pattern = r"([a-zA-Z]+)\((\d+),(\d+)\),\((\d+),(\d+)\)"
+        matches = re.findall(pattern, clean_output)
+        
+        if not matches:
+            print(f"⚠️ Warning: No bounding boxes found matching the regex.")
+            print(f"Raw output was: {raw_output}")
+            return results
+            
         for match in matches:
-            label = match[0]
+            # 1. Unpack Qwen native format order: (ymin, xmin, ymax, xmax)
+            norm_ymin, norm_xmin, norm_ymax, norm_xmax = map(int, match[1:])
             
-            # Extract the normalized [0-1000] coordinates
-            norm_xmin = int(match[1])
-            norm_ymin = int(match[2])
-            norm_xmax = int(match[3])
-            norm_ymax = int(match[4])
+            # Native <box> format doesn't explicitly output a label inside the coordinates
+            label = match[0]  # Assuming the first group is the label (e.g., "signature", "logo", "stamp")
             
-            # If image dimensions are provided, scale back to actual image pixels
-            if img_width and img_height:
-                xmin = int((norm_xmin / 1000.0) * img_width)
-                ymin = int((norm_ymin / 1000.0) * img_height)
-                xmax = int((norm_xmax / 1000.0) * img_width)
-                ymax = int((norm_ymax / 1000.0) * img_height)
+            # 2. Scale back to original dimensions
+            if normalize:
+                xmin = int((norm_xmin / 1000.0) * original_width)
+                ymin = int((norm_ymin / 1000.0) * original_height)
+                xmax = int((norm_xmax / 1000.0) * original_width)
+                ymax = int((norm_ymax / 1000.0) * original_height)
             else:
-                # Otherwise, just return the raw 0-1000 scale
-                xmin, ymin, xmax, ymax = norm_xmin, norm_ymin, norm_xmax, norm_ymax
-                
-            results.append({
-                "label": label,
-                "bbox": [xmin, ymin, xmax, ymax]
-            })
+                xmin, ymin, xmax, ymax = int(norm_xmin), int(norm_ymin), int(norm_xmax), int(norm_ymax)
             
+            # 3. Boundary enforcement (preventing out-of-bounds pixel coordinates)
+            xmin = max(0, min(original_width - 1, xmin))
+            ymin = max(0, min(original_height - 1, ymin))
+            xmax = max(0, min(original_width - 1, xmax))
+            ymax = max(0, min(original_height - 1, ymax))
+            
+            # 4. Ensure coordinates are properly ordered (min first, max second)
+            xmin, xmax = min(xmin, xmax), max(xmin, xmax)
+            ymin, ymax = min(ymin, ymax), max(ymin, ymax)
+            
+            # 5. Validate box size is greater than 0 pixels before appending
+            if (xmax - xmin) > 0 and (ymax - ymin) > 0:
+                results.append({
+                    "label": label,
+                    "bbox": [ymin,xmin,ymax, xmax]
+                })
+                
         return results
